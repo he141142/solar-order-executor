@@ -1,0 +1,93 @@
+name: build-and-deploy
+
+# push main  -> tự động deploy dev
+# chạy tay   -> chọn stg/prd; GitHub environment của stg/prd đặt required reviewers để có bước duyệt
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [dev, stg, prd]
+        default: dev
+
+permissions:
+  id-token: write # OIDC -> AWS, không dùng access key
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-1
+  # Hợp đồng với solar-infra (config/contracts.go) - đổi ở đó thì đổi ở đây.
+  ECR_REPOSITORY: solar/order-executor
+  ECS_CLUSTER: solar-trading
+  ECS_SERVICE: order-executor
+  GOPRIVATE: github.com/he141142/*
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Access private Go modules (solar-shared)
+        env:
+          TOKEN: ${{ secrets.GO_MODULES_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          fi
+      - run: go vet ./...
+      - run: go test ./...
+      - name: Build binary
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dist/executor .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'dev' }}
+    concurrency: deploy-${{ inputs.environment || 'dev' }}
+    env:
+      ENV_TAG: ${{ inputs.environment || 'dev' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }} # output OrderExecutorDeployRoleArn của <env>-trading foundation
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true # repo public: không để lộ account ID trong log
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build & push image (:<sha> bất biến, :<env> trỏ tới bản đang chạy)
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+        run: |
+          docker build --platform linux/amd64 -t "$IMAGE:$GITHUB_SHA" .
+          docker push "$IMAGE:$GITHUB_SHA"
+          docker tag "$IMAGE:$GITHUB_SHA" "$IMAGE:$ENV_TAG"
+          docker push "$IMAGE:$ENV_TAG"
+      - name: Roll ECS service onto the new :env image
+        run: |
+          STATUS=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].status' --output text 2>/dev/null || true)
+          if [ "$STATUS" != "ACTIVE" ]; then
+            echo "::warning::$ECS_CLUSTER/$ECS_SERVICE does not exist yet. Image is pushed; deploy the trading app layer in solar-infra."
+            exit 0
+          fi
+          # Task definition trỏ vào tag :<env>; force-new-deployment để task mới kéo image vừa dời tag.
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --force-new-deployment >/dev/null
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+          echo "Deployed $GITHUB_SHA to $ECS_CLUSTER/$ECS_SERVICE ($ENV_TAG)"
